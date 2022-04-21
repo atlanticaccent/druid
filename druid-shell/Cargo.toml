@@ -92,7 +92,7 @@ bitflags = "1.2.1"
 [target.'cfg(any(target_os="linux", target_os="openbsd"))'.dependencies]
 # TODO(x11/dependencies): only use feature "xcb" if using X11
 cairo-rs = { version = "0.15.1", default_features = false, features = ["xcb"] }
-cairo-sys-rs = { version = "0.15.1", default_features = false, optional = true }
+cairo-sys-rs = { git = "https://github.com/gtk-rs/gtk-rs-core.git", tag = "0.15.10", default_features = false, optional = true }
 gdk-sys = { version = "0.15.1", optional = true }
 # `gtk` gets renamed to `gtk-rs` so that we can use `gtk` as the feature name.
 gtk-rs = { version = "0.15.1", features = ["v3_22"], package = "gtk", optional = true }
