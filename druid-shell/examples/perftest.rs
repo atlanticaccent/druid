@@ -14,6 +14,7 @@
 
 use std::any::Any;
 
+#[allow(deprecated)]
 use time::Instant;
 
 use piet_common::kurbo::{Line, Size};
