@@ -14,8 +14,7 @@
 
 use std::any::Any;
 
-#[allow(deprecated)]
-use time::Instant;
+use std::time::Instant;
 
 use piet_common::kurbo::{Line, Size};
 use piet_common::{Color, FontFamily, Piet, RenderContext, Text, TextLayoutBuilder};
@@ -54,7 +53,7 @@ impl WinHandler for PerfTest {
             1.0,
         );
 
-        let current_ns = (Instant::now() - self.start_time).whole_nanoseconds();
+        let current_ns = (Instant::now() - self.start_time).as_nanos();
         let th = ::std::f64::consts::PI * (current_ns as f64) * 2e-9;
         let dx = 100.0 * th.sin();
         let dy = 100.0 * th.cos();
@@ -65,7 +64,7 @@ impl WinHandler for PerfTest {
         );
 
         let now = Instant::now();
-        let msg = format!("{}ms", (now - self.last_time).whole_milliseconds());
+        let msg = format!("{}ms", (now - self.last_time).as_millis());
         self.last_time = now;
         let layout = piet
             .text()
@@ -143,8 +142,8 @@ fn main() {
     let perf_test = PerfTest {
         size: Size::ZERO,
         handle: Default::default(),
-        start_time: time::Instant::now(),
-        last_time: time::Instant::now(),
+        start_time: std::time::Instant::now(),
+        last_time: std::time::Instant::now(),
         red: true,
     };
     builder.set_handler(Box::new(perf_test));
