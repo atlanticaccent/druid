@@ -1466,8 +1466,9 @@ impl WindowHandle {
 #[cfg(feature = "raw-win-handle")]
 impl HasWindowHandle for WindowHandle {
     fn window_handle(&self) -> Result<raw_window_handle::WindowHandle<'_>, HandleError> {
-        let nsv = self.nsview.load();
-        let handle = AppKitWindowHandle::new(std::ptr::NonNull::from(&nsv).cast());
+        let nsv = *self.nsview.load() as *mut c_void;
+        assert!(!nsv.is_null(), "NSView must not be null pointer");
+        let handle = AppKitWindowHandle::new(std::ptr::NonNull::new(nsv).expect("NSView must not be null"));
 
         let handle =
             unsafe { raw_window_handle::WindowHandle::borrow_raw(RawWindowHandle::AppKit(handle)) };
