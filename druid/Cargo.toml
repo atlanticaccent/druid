@@ -26,6 +26,8 @@ x11 = ["druid-shell/x11"]
 # **WARNING** not ready for the prime time. Many things don't work yet.
 wayland = ["druid-shell/wayland"]
 serde = ["im/serde", "druid-shell/serde"]
+gtk-x11 = ["druid-shell/gtk-x11"]
+gtk-wayland = ["druid-shell/gtk-wayland"]
 
 # Implement HasRawWindowHandle for WindowHandle
 raw-win-handle = ["druid-shell/raw-win-handle"]
