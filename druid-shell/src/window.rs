@@ -446,6 +446,11 @@ impl WindowHandle {
     pub fn get_scale(&self) -> Result<Scale, Error> {
         self.0.get_scale().map_err(Into::into)
     }
+
+    #[cfg(all(target_os = "linux", feature = "gtk"))]
+    pub fn make_container(&self) -> gtk::Box {
+        self.0.make_container()
+    }
 }
 
 #[cfg(feature = "raw-win-handle")]
