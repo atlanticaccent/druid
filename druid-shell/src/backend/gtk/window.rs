@@ -1379,6 +1379,13 @@ impl WindowHandle {
             state.window.set_title(&(title.into()));
         }
     }
+
+    pub fn make_container(&self) -> gtk::Box {
+        let vbox =  gtk::Box::new(gtk::Orientation::Vertical, 0);
+        self.state.upgrade().unwrap().window.add(&vbox);
+
+        vbox
+    }
 }
 
 // WindowState needs to be Send + Sync so it can be passed into glib closures.
