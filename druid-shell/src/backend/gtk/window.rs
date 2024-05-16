@@ -1379,6 +1379,10 @@ impl WindowHandle {
             state.window.set_title(&(title.into()));
         }
     }
+
+    pub fn get_gtk_application_window(&self) -> gtk::ApplicationWindow {
+        self.state.upgrade().unwrap().window.clone()
+    }
 }
 
 // WindowState needs to be Send + Sync so it can be passed into glib closures.
