@@ -121,10 +121,50 @@ impl PartialEq for WindowHandle {
 }
 impl Eq for WindowHandle {}
 
-#[cfg(feature = "raw-win-handle")]
+#[cfg(all(
+    feature = "raw-win-handle",
+    not(any(feature = "gtk-x11", feature = "gtk-wayland"))
+))]
 impl HasWindowHandle for WindowHandle {
     fn window_handle(&self) -> Result<raw_window_handle::WindowHandle<'_>, HandleError> {
         tracing::error!("HasRawWindowHandle trait not implemented for gtk.");
+        Err(HandleError::NotSupported)
+    }
+}
+
+#[cfg(all(
+    feature = "raw-win-handle",
+    any(feature = "gtk-x11", feature = "gtk-wayland")
+))]
+impl HasWindowHandle for WindowHandle {
+    fn window_handle(&self) -> Result<raw_window_handle::WindowHandle<'_>, HandleError> {
+        let state = self.state.upgrade().ok_or(HandleError::Unavailable)?;
+        let window = state.window.window().ok_or(HandleError::Unavailable)?;
+        tracing::info!("GTK window type: {}", window.type_());
+
+        #[cfg(feature = "gtk-x11")]
+        let window = match window.downcast::<gdkx11::X11Window>() {
+            Ok(window) => {
+                let xid = unsafe { gdk_x11_sys::gdk_x11_window_get_xid(window.as_ptr()) };
+                let handle = raw_window_handle::XlibWindowHandle::new(xid);
+                let raw = raw_window_handle::RawWindowHandle::Xlib(handle);
+
+                return Ok(unsafe { raw_window_handle::WindowHandle::borrow_raw(raw) });
+            }
+            Err(window) => window,
+        };
+        #[cfg(feature = "gtk-wayland")]
+        if let Ok(window) = window.downcast::<gdkwayland::WaylandWindow>() {
+            let surface = unsafe {
+                gdk_wayland_sys::gdk_wayland_window_get_wl_surface(window.as_ptr() as *mut _)
+            };
+            let surface = unsafe { std::ptr::NonNull::new_unchecked(surface) };
+            let handle = raw_window_handle::WaylandWindowHandle::new(surface);
+            let raw = raw_window_handle::RawWindowHandle::Wayland(handle);
+
+            return Ok(unsafe { raw_window_handle::WindowHandle::borrow_raw(raw) });
+        }
+
         Err(HandleError::NotSupported)
     }
 }
