@@ -1380,11 +1380,8 @@ impl WindowHandle {
         }
     }
 
-    pub fn make_container(&self) -> gtk::Box {
-        let vbox =  gtk::Box::new(gtk::Orientation::Vertical, 0);
-        self.state.upgrade().unwrap().window.add(&vbox);
-
-        vbox
+    pub fn get_gtk_application_window(&self) -> gtk::ApplicationWindow {
+        self.state.upgrade().unwrap().window.clone()
     }
 }
 

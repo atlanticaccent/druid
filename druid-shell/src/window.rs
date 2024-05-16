@@ -448,8 +448,8 @@ impl WindowHandle {
     }
 
     #[cfg(all(target_os = "linux", feature = "gtk"))]
-    pub fn make_container(&self) -> gtk::Box {
-        self.0.make_container()
+    pub fn get_gtk_application_window(&self) -> gtk::ApplicationWindow {
+        self.0.get_gtk_application_window()
     }
 }
 
