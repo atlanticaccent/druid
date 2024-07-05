@@ -25,6 +25,8 @@ use std::marker::PhantomData;
 use std::ops::Deref;
 use std::sync::Arc;
 
+use xxhash_rust::xxh3::Xxh3Builder;
+
 use crate::kurbo::RoundedRectRadii;
 use crate::localization::L10nManager;
 use crate::text::FontDescriptor;
@@ -56,7 +58,7 @@ pub struct Env(Arc<EnvImpl>);
 
 #[derive(Debug, Clone)]
 struct EnvImpl {
-    map: HashMap<ArcStr, Value>,
+    map: HashMap<ArcStr, Value, Xxh3Builder>,
     l10n: Option<Arc<L10nManager>>,
 }
 
@@ -506,7 +508,7 @@ impl Env {
     pub fn empty() -> Self {
         Env(Arc::new(EnvImpl {
             l10n: None,
-            map: HashMap::new(),
+            map: HashMap::with_hasher(Xxh3Builder::new()),
         }))
     }
 
@@ -519,7 +521,7 @@ impl Env {
 
         let inner = EnvImpl {
             l10n: Some(Arc::new(l10n)),
-            map: HashMap::new(),
+            map: HashMap::with_hasher(Xxh3Builder::new()),
         };
 
         let env = Env(Arc::new(inner))
