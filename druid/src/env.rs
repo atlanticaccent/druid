@@ -21,11 +21,11 @@ use std::any::{self, Any};
 use std::borrow::Borrow;
 use std::collections::{hash_map::Entry, HashMap};
 use std::fmt::{Debug, Formatter};
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::marker::PhantomData;
 use std::ops::Deref;
+use std::rc::Rc;
 use std::sync::Arc;
-
-use xxhash_rust::xxh3::Xxh3Builder;
 
 use crate::kurbo::RoundedRectRadii;
 use crate::localization::L10nManager;
@@ -54,11 +54,12 @@ use crate::{ArcStr, Color, Data, Insets, Point, Rect, Size};
 ///
 /// [`EnvScope`]: crate::widget::EnvScope
 #[derive(Clone)]
-pub struct Env(Arc<EnvImpl>);
+pub struct Env(Rc<EnvImpl>);
 
 #[derive(Debug, Clone)]
 struct EnvImpl {
-    map: HashMap<ArcStr, Value, Xxh3Builder>,
+    map: HashMap<ArcStr, (u64, Value), ahash::RandomState>,
+    map_hash: u64,
     l10n: Option<Arc<L10nManager>>,
 }
 
@@ -110,9 +111,33 @@ pub enum Value {
     String(ArcStr),
     Font(FontDescriptor),
     RoundedRectRadii(RoundedRectRadii),
-    Other(Arc<dyn Any + Send + Sync>),
+    Other(Arc<dyn Other + Send + Sync>),
 }
 // ANCHOR_END: value_type
+
+/// Dynamic type for Other
+pub trait Other: Any + Debug + DynHash {
+    /// Cast self to Any
+    fn as_any(&self) -> &dyn Any;
+}
+
+impl<T: Any + Debug + DynHash> Other for T {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Object safe Hash trait
+pub trait DynHash {
+    /// Hash
+    fn dyn_hash(&self, state: &mut dyn Hasher);
+}
+
+impl<H: Hash + ?Sized> DynHash for H {
+    fn dyn_hash(&self, mut state: &mut dyn Hasher) {
+        self.hash(&mut state);
+    }
+}
 
 /// Either a concrete `T` or a [`Key<T>`] that can be resolved in the [`Env`].
 ///
@@ -167,6 +192,9 @@ impl<T> KeyLike<T> for KeyOrValue<T> {
 pub trait ValueType: Sized + Clone + Into<Value> {
     /// Attempt to convert the generic `Value` into this type.
     fn try_from_value(v: &Value) -> Result<Self, ValueTypeError>;
+
+    /// Fallible hashing method
+    fn hash(&self, hasher: &mut impl Hasher);
 }
 
 /// The error type for environment access.
@@ -189,6 +217,8 @@ pub struct MissingKeyError {
 }
 
 impl Env {
+    const HASH_BUILDER: ahash::RandomState = ahash::RandomState::with_seeds(0, 0, 0, 0);
+
     /// State for whether or not to paint colorful rectangles for layout
     /// debugging.
     ///
@@ -255,7 +285,7 @@ impl Env {
         self.0
             .map
             .get(key.borrow().key)
-            .map(|value| value.to_inner_unchecked())
+            .map(|value| value.1.to_inner_unchecked())
             .ok_or(MissingKeyError {
                 key: key.borrow().key.into(),
             })
@@ -284,9 +314,13 @@ impl Env {
     /// This is not intended for general use, but only for inspecting an `Env`
     /// e.g. for debugging, theme editing, and theme loading.
     pub fn try_get_untyped<V>(&self, key: impl Borrow<Key<V>>) -> Result<&Value, MissingKeyError> {
-        self.0.map.get(key.borrow().key).ok_or(MissingKeyError {
-            key: key.borrow().key.into(),
-        })
+        self.0
+            .map
+            .get(key.borrow().key)
+            .ok_or(MissingKeyError {
+                key: key.borrow().key.into(),
+            })
+            .map(|(_, v)| v)
     }
 
     /// Gets the entire contents of the `Env`, in key-value pairs.
@@ -294,13 +328,23 @@ impl Env {
     /// *WARNING:* This is not intended for general use, but only for inspecting an `Env` e.g.
     /// for debugging, theme editing, and theme loading.
     pub fn get_all(&self) -> impl ExactSizeIterator<Item = (&ArcStr, &Value)> {
-        self.0.map.iter()
+        self.0.map.iter().map(|(k, (_, v))| (k, v))
     }
 
     /// Adds a key/value, acting like a builder.
     pub fn adding<V: ValueType>(mut self, key: Key<V>, value: impl Into<V>) -> Env {
-        let env = Arc::make_mut(&mut self.0);
-        env.map.insert(key.into(), value.into().into());
+        let env = Rc::make_mut(&mut self.0);
+        let value = value.into();
+        let mut state = Env::HASH_BUILDER.build_hasher();
+        value.hash(&mut state);
+        env.map.insert(key.into(), (state.finish(), value.into()));
+
+        let mut state = Env::HASH_BUILDER.build_hasher();
+        env.map
+            .values()
+            .for_each(|(h, _)| Hash::hash(h, &mut state));
+        env.map_hash = state.finish();
+
         self
     }
 
@@ -324,20 +368,30 @@ impl Env {
         key: Key<V>,
         raw: Value,
     ) -> Result<(), ValueTypeError> {
-        let env = Arc::make_mut(&mut self.0);
+        let env = Rc::make_mut(&mut self.0);
         let key = key.into();
+        let mut state = Env::HASH_BUILDER.build_hasher();
+        raw.hash(&mut state);
+        let hash = state.finish();
         match env.map.entry(key) {
             Entry::Occupied(mut e) => {
                 let existing = e.get_mut();
-                if !existing.is_same_type(&raw) {
+                if !existing.1.is_same_type(&raw) {
                     return Err(ValueTypeError::new(any::type_name::<V>(), raw));
                 }
-                *existing = raw;
+                *existing = (hash, raw);
             }
             Entry::Vacant(e) => {
-                e.insert(raw);
+                e.insert((hash, raw));
             }
         }
+
+        let mut state = Env::HASH_BUILDER.build_hasher();
+        env.map
+            .values()
+            .for_each(|(h, _)| Hash::hash(h, &mut state));
+        env.map_hash = state.finish();
+
         Ok(())
     }
 
@@ -443,6 +497,25 @@ impl Value {
     }
 }
 
+impl Hash for Value {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self {
+            Value::Point(val) => val.hash(state),
+            Value::Size(val) => val.hash(state),
+            Value::Rect(val) => val.hash(state),
+            Value::Insets(val) => val.hash(state),
+            Value::Color(val) => Hash::hash(val, state),
+            Value::Float(val) => val.hash(state),
+            Value::Bool(val) => Hash::hash(val, state),
+            Value::UnsignedInt(val) => Hash::hash(val, state),
+            Value::String(val) => Hash::hash(val, state),
+            Value::Font(val) => val.hash(state),
+            Value::RoundedRectRadii(val) => val.hash(state),
+            Value::Other(val) => val.dyn_hash(state),
+        }
+    }
+}
+
 impl Debug for Value {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         match self {
@@ -464,17 +537,18 @@ impl Debug for Value {
 
 impl Data for Env {
     fn same(&self, other: &Env) -> bool {
-        Arc::ptr_eq(&self.0, &other.0) || self.0.deref().same(other.0.deref())
+        Rc::ptr_eq(&self.0, &other.0) || self.0.deref().same(other.0.deref())
     }
 }
 
 impl Data for EnvImpl {
     fn same(&self, other: &EnvImpl) -> bool {
         self.map.len() == other.map.len()
-            && self
-                .map
-                .iter()
-                .all(|(k, v1)| other.map.get(k).map(|v2| v1.same(v2)).unwrap_or(false))
+            && (self.map_hash == other.map_hash
+                || self
+                    .map
+                    .iter()
+                    .all(|(k, v1)| other.map.get(k).map(|v2| v1.0 == v2.0).unwrap_or(false)))
     }
 }
 
@@ -506,9 +580,10 @@ impl Env {
     ///
     /// This is useful for creating a set of overrides.
     pub fn empty() -> Self {
-        Env(Arc::new(EnvImpl {
+        Env(Rc::new(EnvImpl {
             l10n: None,
-            map: HashMap::with_hasher(Xxh3Builder::new()),
+            map: HashMap::with_hasher(ahash::RandomState::new()),
+            map_hash: 0,
         }))
     }
 
@@ -521,10 +596,11 @@ impl Env {
 
         let inner = EnvImpl {
             l10n: Some(Arc::new(l10n)),
-            map: HashMap::with_hasher(Xxh3Builder::new()),
+            map: HashMap::with_hasher(ahash::RandomState::new()),
+            map_hash: 0,
         };
 
-        let env = Env(Arc::new(inner))
+        let env = Env(Rc::new(inner))
             .adding(Env::DEBUG_PAINT, false)
             .adding(Env::DEBUG_WIDGET_ID, false)
             .adding(Env::DEBUG_WIDGET, false);
@@ -573,12 +649,21 @@ impl std::error::Error for MissingKeyError {}
 /// Use this macro for types which are cheap to clone (ie all `Copy` types).
 macro_rules! impl_value_type {
     ($ty:ty, $var:ident) => {
+        impl_value_type!($ty, $var, |val, hasher| {
+            Hash::hash(val, hasher);
+        });
+    };
+    ($ty:ty, $var:ident, $hash:expr) => {
         impl ValueType for $ty {
             fn try_from_value(value: &Value) -> Result<Self, ValueTypeError> {
                 match value {
                     Value::$var(f) => Ok(f.to_owned()),
                     other => Err(ValueTypeError::new(any::type_name::<$ty>(), other.clone())),
                 }
+            }
+
+            fn hash(&self, hasher: &mut impl Hasher) {
+                $hash(self, hasher);
             }
         }
 
@@ -590,34 +675,89 @@ macro_rules! impl_value_type {
     };
 }
 
-impl_value_type!(f64, Float);
 impl_value_type!(bool, Bool);
 impl_value_type!(u64, UnsignedInt);
 impl_value_type!(Color, Color);
-impl_value_type!(Rect, Rect);
-impl_value_type!(Point, Point);
-impl_value_type!(Size, Size);
-impl_value_type!(Insets, Insets);
+impl_value_type!(Rect, Rect, |rect: &Rect, mut hasher| {
+    Hash::hash(&rect.x0.to_bits(), &mut hasher);
+    Hash::hash(&rect.y0.to_bits(), &mut hasher);
+    Hash::hash(&rect.x1.to_bits(), &mut hasher);
+    Hash::hash(&rect.y1.to_bits(), &mut hasher);
+});
+impl_value_type!(Point, Point, |point: &Point, mut hasher| {
+    Hash::hash(&point.x.to_bits(), &mut hasher);
+    Hash::hash(&point.y.to_bits(), &mut hasher);
+});
+impl_value_type!(Size, Size, |size: &Size, mut state| {
+    Hash::hash(&size.width.to_bits(), &mut state);
+    Hash::hash(&size.height.to_bits(), &mut state)
+});
+impl_value_type!(Insets, Insets, |insets: &Insets, mut state| {
+    Hash::hash(&insets.x0.to_bits(), &mut state);
+    Hash::hash(&insets.y0.to_bits(), &mut state);
+    Hash::hash(&insets.x1.to_bits(), &mut state);
+    Hash::hash(&insets.y1.to_bits(), &mut state);
+});
 impl_value_type!(ArcStr, String);
-impl_value_type!(FontDescriptor, Font);
-impl_value_type!(RoundedRectRadii, RoundedRectRadii);
+impl_value_type!(FontDescriptor, Font, |font: &FontDescriptor, mut state| {
+    Hash::hash(&font.family, &mut state);
+    Hash::hash(&font.style, &mut state);
+    Hash::hash(&font.weight, &mut state);
+    Hash::hash(&font.size.to_bits(), &mut state)
+});
+impl_value_type!(
+    RoundedRectRadii,
+    RoundedRectRadii,
+    |rad: &RoundedRectRadii, mut state| {
+        Hash::hash(&rad.bottom_left.to_bits(), &mut state);
+        Hash::hash(&rad.bottom_right.to_bits(), &mut state);
+        Hash::hash(&rad.top_left.to_bits(), &mut state);
+        Hash::hash(&rad.top_right.to_bits(), &mut state);
+    }
+);
 
-impl<T: 'static + Send + Sync> From<Arc<T>> for Value {
+impl ValueType for f64 {
+    fn try_from_value(value: &Value) -> Result<Self, ValueTypeError> {
+        match value {
+            Value::Float(f) => Ok(f.to_owned()),
+            other => Err(ValueTypeError::new(any::type_name::<f64>(), other.clone())),
+        }
+    }
+    fn hash(&self, mut state: &mut impl Hasher) {
+        Hash::hash(&self.to_bits(), &mut state);
+    }
+}
+
+impl From<f64> for Value {
+    fn from(val: f64) -> Value {
+        Value::Float(val)
+    }
+}
+
+impl<T: 'static + Send + Sync + Other> From<Arc<T>> for Value {
     fn from(this: Arc<T>) -> Value {
         Value::Other(this)
     }
 }
 
-impl<T: 'static + Send + Sync> ValueType for Arc<T> {
+impl<T: 'static + Other + Send + Sync + Clone> ValueType for Arc<T> {
     fn try_from_value(v: &Value) -> Result<Self, ValueTypeError> {
         let err = ValueTypeError {
             expected: any::type_name::<T>(),
             found: v.clone(),
         };
         match v {
-            Value::Other(o) => o.clone().downcast::<T>().map_err(|_| err),
+            Value::Other(o) => o
+                .as_any()
+                .downcast_ref::<T>()
+                .ok_or(err)
+                .map(|v| Arc::new(v.clone())),
             _ => Err(err),
         }
+    }
+
+    fn hash(&self, state: &mut impl Hasher) {
+        self.dyn_hash(state)
     }
 }
 
