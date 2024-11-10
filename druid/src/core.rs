@@ -608,30 +608,47 @@ impl<T: Data, W: Widget<T>> WidgetPod<T, W> {
     ///
     /// [`event`]: Widget::event
     pub fn event(&mut self, ctx: &mut EventCtx, event: &Event, data: &mut T, env: &Env) {
-        if !self.is_initialized() {
-            debug_panic!(
-                "{:?} with widget id {:?}: event method called before receiving WidgetAdded.",
-                self.inner.type_name(),
-                ctx.widget_id()
-            );
+        fn event_assert_invariant(
+            initialized: bool,
+            state: &WidgetState,
+            event: &Event,
+            inner_type: &str,
+            widget_id: Option<WidgetId>,
+        ) -> bool {
+            if !initialized {
+                debug_panic!(
+                    "{:?} with widget id {:?}: event method called before receiving WidgetAdded.",
+                    inner_type,
+                    widget_id
+                );
+                return true;
+            }
+
+            // log if we seem not to be laid out when we should be
+            if state.is_expecting_set_origin_call && !event.should_propagate_to_hidden() {
+                warn!(
+                    "{:?} with widget id {:?} received an event ({:?}) without having been laid out. \
+                This likely indicates a missed call to set_origin.",
+                    inner_type,
+                    widget_id,
+                    event,
+                );
+            }
+
+            false
+        }
+
+        if event_assert_invariant(
+            self.is_initialized(),
+            self.state(),
+            event,
+            self.inner.type_name(),
+            self.inner.id(),
+        ) {
             return;
         }
 
-        // log if we seem not to be laid out when we should be
-        if self.state.is_expecting_set_origin_call && !event.should_propagate_to_hidden() {
-            warn!(
-                "{:?} with widget id {:?} received an event ({:?}) without having been laid out. \
-                This likely indicates a missed call to set_origin.",
-                self.inner.type_name(),
-                ctx.widget_id(),
-                event,
-            );
-        }
-
         // TODO: factor as much logic as possible into monomorphic functions.
-        // a follow_up event should reach the widget which handled the first event.
-        // in this case we dont discard events when ctx.is_handled is set but just dont set our hot
-        // state to true
         let follow_up_event = event.is_pointer_event() && self.state.has_active;
         if ctx.is_handled && !follow_up_event {
             // This function is called by containers to propagate an event from
@@ -639,67 +656,111 @@ impl<T: Data, W: Widget<T>> WidgetPod<T, W> {
             // from other points in the library.
             return;
         }
-        let had_active = self.state.has_active;
-        let rect = self.layout_rect();
 
-        // If we need to replace either the event or its data.
+        // a follow_up event should reach the widget which handled the first event.
+        // in this case we dont discard events when ctx.is_handled is set but just dont set our hot
+        // state to true
+        let had_active = self.state.has_active;
+
+        fn mono_event_handler(
+            self_id: WidgetId,
+            state: &mut WidgetState,
+            event: &Event,
+            had_active: bool,
+            is_root: bool,
+            modified_event: &mut Option<Event>,
+        ) -> bool {
+            match event {
+                Event::Internal(internal) => match internal {
+                    InternalEvent::TargetedCommand(cmd) => {
+                        match cmd.target() {
+                            Target::Widget(id) if id == self_id => {
+                                modified_event.replace(Event::Command(cmd.clone()));
+                                true
+                            }
+                            Target::Widget(id) => {
+                                // Recurse when the target widget could be our descendant.
+                                // The bloom filter we're checking can return false positives.
+                                state.children.may_contain(&id)
+                            }
+                            Target::Global | Target::Window(_) => {
+                                modified_event.replace(Event::Command(cmd.clone()));
+                                true
+                            }
+                            _ => false,
+                        }
+                    }
+                    InternalEvent::RouteTimer(token, widget_id) => {
+                        if *widget_id == self_id {
+                            modified_event.replace(Event::Timer(*token));
+                            true
+                        } else {
+                            state.children.may_contain(widget_id)
+                        }
+                    }
+                    InternalEvent::RouteImeStateChange(widget_id) => {
+                        if *widget_id == self_id {
+                            modified_event.replace(Event::ImeStateChange);
+                            true
+                        } else {
+                            state.children.may_contain(widget_id)
+                        }
+                    }
+                    InternalEvent::MouseLeave => false,
+                },
+                Event::WindowConnected | Event::WindowCloseRequested => true,
+                Event::WindowScale(_) => {
+                    state.needs_layout = true;
+                    true
+                }
+                Event::WindowSize(_) => {
+                    state.needs_layout = true;
+                    is_root
+                }
+                Event::AnimFrame(_) => {
+                    let r = state.request_anim;
+                    state.request_anim = false;
+                    r
+                }
+                Event::KeyDown(_) => state.has_focus,
+                Event::KeyUp(_) => state.has_focus,
+                Event::Paste(_) => state.has_focus,
+                Event::Zoom(_) => had_active || state.is_hot,
+                Event::Timer(_) => false, // This event was targeted only to our parent
+                Event::ImeStateChange => true, // once delivered to the focus widget, recurse to the component?
+                Event::Command(_) => true,
+                Event::Notification(_) => false,
+                Event::WindowDisconnected
+                | Event::MouseDown(_)
+                | Event::MouseUp(_)
+                | Event::MouseMove(_)
+                | Event::Wheel(_) => false,
+            }
+        }
+
         let mut modified_event = None;
 
-        let recurse = match event {
-            Event::Internal(internal) => match internal {
-                InternalEvent::MouseLeave => {
-                    let hot_changed = self.set_hot_state(ctx.state, None, data, env);
-                    had_active || hot_changed
-                }
-                InternalEvent::TargetedCommand(cmd) => {
-                    match cmd.target() {
-                        Target::Widget(id) if id == self.id() => {
-                            modified_event = Some(Event::Command(cmd.clone()));
-                            true
-                        }
-                        Target::Widget(id) => {
-                            // Recurse when the target widget could be our descendant.
-                            // The bloom filter we're checking can return false positives.
-                            self.state.children.may_contain(&id)
-                        }
-                        Target::Global | Target::Window(_) => {
-                            modified_event = Some(Event::Command(cmd.clone()));
-                            true
-                        }
-                        _ => false,
-                    }
-                }
-                InternalEvent::RouteTimer(token, widget_id) => {
-                    if *widget_id == self.id() {
-                        modified_event = Some(Event::Timer(*token));
-                        true
-                    } else {
-                        self.state.children.may_contain(widget_id)
-                    }
-                }
-                InternalEvent::RouteImeStateChange(widget_id) => {
-                    if *widget_id == self.id() {
-                        modified_event = Some(Event::ImeStateChange);
-                        true
-                    } else {
-                        self.state.children.may_contain(widget_id)
-                    }
-                }
-            },
-            Event::WindowConnected | Event::WindowCloseRequested => true,
+        let mut recurse = mono_event_handler(
+            self.id(),
+            &mut self.state,
+            event,
+            had_active,
+            ctx.is_root,
+            &mut modified_event,
+        );
+
+        let rect = self.layout_rect();
+
+        recurse |= match event {
+            Event::Internal(InternalEvent::MouseLeave) => {
+                let hot_changed = self.set_hot_state(ctx.state, None, data, env);
+                had_active || hot_changed
+            }
             Event::WindowDisconnected => {
                 for (window_id, _) in &self.state.sub_window_hosts {
                     ctx.submit_command(CLOSE_WINDOW.to(*window_id))
                 }
                 true
-            }
-            Event::WindowScale(_) => {
-                self.state.needs_layout = true;
-                true
-            }
-            Event::WindowSize(_) => {
-                self.state.needs_layout = true;
-                ctx.is_root
             }
             Event::MouseDown(mouse_event) => {
                 self.set_hot_state(
@@ -784,19 +845,7 @@ impl<T: Data, W: Widget<T>> WidgetPod<T, W> {
                     false
                 }
             }
-            Event::AnimFrame(_) => {
-                let r = self.state.request_anim;
-                self.state.request_anim = false;
-                r
-            }
-            Event::KeyDown(_) => self.state.has_focus,
-            Event::KeyUp(_) => self.state.has_focus,
-            Event::Paste(_) => self.state.has_focus,
-            Event::Zoom(_) => had_active || self.state.is_hot,
-            Event::Timer(_) => false, // This event was targeted only to our parent
-            Event::ImeStateChange => true, // once delivered to the focus widget, recurse to the component?
-            Event::Command(_) => true,
-            Event::Notification(_) => false,
+            _ => false,
         };
 
         if recurse {
@@ -829,7 +878,7 @@ impl<T: Data, W: Widget<T>> WidgetPod<T, W> {
                     ctx.is_handled = true;
                 }
                 _ => {
-                    self.inner.event(&mut inner_ctx, inner_event, data, env);
+                    self.inner.event(&mut inner_ctx, &inner_event, data, env);
 
                     inner_ctx.widget_state.has_active |= inner_ctx.widget_state.is_active;
                     ctx.is_handled |= inner_ctx.is_handled;
